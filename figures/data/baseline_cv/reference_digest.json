@@ -1,0 +1,84 @@
+{
+  "columns": [
+    "complex_id",
+    "is_binder",
+    "train_40",
+    "train_100",
+    "train_300",
+    "is_eval"
+  ],
+  "targets": {
+    "588689": {
+      "sha256": "3fe71d918c7e66001091c7f46e407c9cdf80c12bf9b4faee995b32391a320e0f",
+      "n_rows": 49985,
+      "n_eval": 49685,
+      "n_active_eval": 396,
+      "n_train_40": 40,
+      "n_train_100": 100,
+      "n_train_300": 300
+    },
+    "540297-493091": {
+      "sha256": "b5ad20051f50fb8c74fb72eba1e5003c97901999c8c8ca03126764e5df926cbc",
+      "n_rows": 49985,
+      "n_eval": 49685,
+      "n_active_eval": 739,
+      "n_train_40": 40,
+      "n_train_100": 100,
+      "n_train_300": 300
+    },
+    "434954-2097": {
+      "sha256": "887352e777b4ad0d3e9f3abfec27be1d3f98d29eda21b554bb24baaa0dafad2c",
+      "n_rows": 49915,
+      "n_eval": 49615,
+      "n_active_eval": 415,
+      "n_train_40": 40,
+      "n_train_100": 100,
+      "n_train_300": 300
+    },
+    "463203-2650": {
+      "sha256": "af7934242430b0bad0d93c98227edfc78152c30d984d4140059fc246a7010223",
+      "n_rows": 49882,
+      "n_eval": 49582,
+      "n_active_eval": 542,
+      "n_train_40": 40,
+      "n_train_100": 100,
+      "n_train_300": 300
+    },
+    "493248-485317": {
+      "sha256": "74b7aa45071959625c1eca04d5c4224e220bbf72583674229ee99e8afe09455f",
+      "n_rows": 49980,
+      "n_eval": 49680,
+      "n_active_eval": 953,
+      "n_train_40": 40,
+      "n_train_100": 100,
+      "n_train_300": 300
+    },
+    "504329": {
+      "sha256": "5750527f4d58cabb7647d8a68a3fb2c2892bcc456aa74cd5db5f5bc02027ded8",
+      "n_rows": 49982,
+      "n_eval": 49682,
+      "n_active_eval": 438,
+      "n_train_40": 40,
+      "n_train_100": 100,
+      "n_train_300": 300
+    },
+    "624273-588549": {
+      "sha256": "8a296f42a52d9ac7d6fb414cc0ec23bdfcca44cff0ce166a0d55e7886c252d49",
+      "n_rows": 49987,
+      "n_eval": 49687,
+      "n_active_eval": 150,
+      "n_train_40": 40,
+      "n_train_100": 100,
+      "n_train_300": 300
+    },
+    "1053173-743445": {
+      "sha256": "0758485205d15f17b7fdf1f0df67ad85806aeb2816d79fe30ada2726be26db68",
+      "n_rows": 49995,
+      "n_eval": 49695,
+      "n_active_eval": 134,
+      "n_train_40": 40,
+      "n_train_100": 100,
+      "n_train_300": 300
+    }
+  }
+}

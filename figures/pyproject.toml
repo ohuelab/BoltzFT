@@ -1,0 +1,5 @@
+[project]
+name = "boltzft-figures"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["matplotlib>=3.10,<4", "numpy>=2,<3", "pandas>=2.2,<4", "scipy>=1.15,<2"]

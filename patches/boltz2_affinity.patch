@@ -1,0 +1,1301 @@
+diff --git a/scripts/train/config_aff/config.yaml b/scripts/train/config_aff/config.yaml
+index 795ea65..d0c51a0 100644
+--- a/scripts/train/config_aff/config.yaml
++++ b/scripts/train/config_aff/config.yaml
+@@ -17,6 +17,7 @@ resume: null
+ disable_checkpoint: false
+ save_top_k: -1
+ matmul_precision: high
++seed: null
+ 
+ # Trainer
+ # Tune max_epochs and accumulate_grad_batches per experiment;
+diff --git a/scripts/train/config_aff/data/default.yaml b/scripts/train/config_aff/data/default.yaml
+index f9cbc46..33a4ce4 100644
+--- a/scripts/train/config_aff/data/default.yaml
++++ b/scripts/train/config_aff/data/default.yaml
+@@ -41,6 +41,7 @@ samples_per_epoch: ${paths.samples_per_epoch}
+ batch_size: 1
+ num_workers: 0
+ random_seed: 43
++train_random_seed: null
+ pin_memory: true
+ overfit: null
+ 
+diff --git a/scripts/train/trainv2.py b/scripts/train/trainv2.py
+index 1b83a4e..872bc65 100644
+--- a/scripts/train/trainv2.py
++++ b/scripts/train/trainv2.py
+@@ -23,6 +23,10 @@ from hydra import compose, initialize_config_dir
+ from hydra.core.global_hydra import GlobalHydra
+ 
+ 
++
++
++
++
+ @dataclass
+ class TrainConfig:
+     """Train configuration.
+@@ -79,6 +83,7 @@ class TrainConfig:
+     debug: bool = False
+     strict_loading: bool = True
+     load_confidence_from_trunk: Optional[bool] = False
++    seed: Optional[int] = None
+ 
+ 
+ def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912, PLR0915
+@@ -104,9 +109,16 @@ def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912, PLR
+     raw_config.pop("paths", None)
+     raw_config = omegaconf.OmegaConf.create(raw_config)
+ 
++    # Seed Python, NumPy, torch and DataLoader workers when requested.
++    configured_seed = raw_config.get("seed")
++    if configured_seed is not None:
++        pl.seed_everything(int(configured_seed), workers=True)
++
+     # Instantiate the task
+     cfg = hydra.utils.instantiate(raw_config)
+     cfg = TrainConfig(**cfg)
++    if cfg.seed is not None and cfg.data.train_random_seed is None:
++        cfg.data.train_random_seed = int(cfg.seed)
+ 
+     # Set matmul precision
+     if cfg.matmul_precision is not None:
+@@ -139,7 +151,7 @@ def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912, PLR
+     if cfg.pretrained and not cfg.resume:
+         file_path = cfg.pretrained
+ 
+-        print(f"Loading model from {file_path}")
++        print(f"Loading model from {file_path}", flush=True)
+         model_module = type(model_module).load_from_checkpoint(
+             file_path, map_location="cpu", strict=True, **(model_module.hparams)
+         )
+@@ -150,15 +162,16 @@ def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912, PLR
+     if not cfg.disable_checkpoint:
+         # Determine what metric to monitor based on configuration
+         if hasattr(cfg.model, 'affinity_prediction') and cfg.model.affinity_prediction:
+-            monitor_metric = "val/affinity_pearson"
+-            monitor_mode = "max"
++            # Binary-only training uses the final epoch checkpoint.
++            monitor_metric = None
++            monitor_mode = "min"  # ignored when monitor=None, but must be min/max
+         elif hasattr(cfg.model, 'validate_structure') and cfg.model.validate_structure:
+             monitor_metric = "val/lddt"
+             monitor_mode = "max"
+         else:
+             # Default: just save all
+             monitor_metric = None
+-            monitor_mode = None
++            monitor_mode = "min"  # ignored when monitor=None, but must be min/max
+ 
+         mc = ModelCheckpoint(
+             monitor=monitor_metric,
+@@ -169,6 +182,7 @@ def train(raw_config: str, args: list[str]) -> None:  # noqa: C901, PLR0912, PLR
+         )
+         callbacks = [mc]
+ 
++
+     # Create wandb logger
+     loggers = []
+     if wandb:
+diff --git a/src/boltz/data/crop_embeddings.py b/src/boltz/data/crop_embeddings.py
+new file mode 100644
+index 0000000..0c5e31d
+--- /dev/null
++++ b/src/boltz/data/crop_embeddings.py
+@@ -0,0 +1,233 @@
++"""Cache ligand-incident pair representations and affinity-head inputs."""
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Optional, Union
++
++import numpy as np
++import torch
++
++CROPPED_FORMAT = "cropped_v1"
++AFFINITY_CROPPED_FORMAT = "affinity_cropped_v1"
++
++
++def _to_numpy(x) -> np.ndarray:
++    if isinstance(x, torch.Tensor):
++        return x.detach().cpu().numpy()
++    return np.asarray(x)
++
++
++def save_cropped_z(
++    path: Union[str, Path],
++    z: torch.Tensor,
++    keep_token_mask: torch.Tensor,
++    token_pad_mask: Optional[torch.Tensor] = None,
++    original_token_indices: Optional[torch.Tensor] = None,
++) -> None:
++    """Save pair strips in the original token order.
++
++    keep_token_mask must include every affinity binder token."""
++    z = _to_numpy(z)
++    if z.ndim == 4:
++        if z.shape[0] != 1:
++            msg = f"save_cropped_z expects batch size 1, got z.shape={z.shape}"
++            raise ValueError(msg)
++        z = z[0]
++    elif z.ndim != 3:
++        msg = f"Unexpected z shape {z.shape}; expected [B,L,L,C] or [L,L,C]."
++        raise ValueError(msg)
++
++    lig_mask = _to_numpy(keep_token_mask).astype(bool)
++    if lig_mask.ndim == 2:
++        lig_mask = lig_mask[0]
++    if token_pad_mask is not None:
++        pad = _to_numpy(token_pad_mask).astype(bool)
++        if pad.ndim == 2:
++            pad = pad[0]
++        lig_mask = lig_mask & pad
++
++    L = z.shape[0]
++    lig_idx = np.nonzero(lig_mask[:L])[0].astype(np.int64)
++    if lig_idx.size == 0:
++        msg = "No keep tokens found (empty ligand/keep mask); cannot crop z."
++        raise ValueError(msg)
++
++    z_rows = np.ascontiguousarray(z[lig_idx, :, :], dtype=np.float32)
++    z_cols = np.ascontiguousarray(z[:, lig_idx, :], dtype=np.float32)
++
++    arrays = {
++        "format": np.array(CROPPED_FORMAT),
++        "z_rows": z_rows,
++        "z_cols": z_cols,
++        "lig_idx": lig_idx,
++        "L": np.array(L, dtype=np.int64),
++    }
++    if token_pad_mask is not None:
++        pad_out = _to_numpy(token_pad_mask).astype(bool)
++        if pad_out.ndim == 2:
++            pad_out = pad_out[0]
++        arrays["token_pad_mask"] = pad_out[:L]
++    if original_token_indices is not None:
++        oti = _to_numpy(original_token_indices).astype(np.int64)
++        if oti.ndim == 2:
++            oti = oti[0]
++        arrays["original_token_indices"] = oti[:L]
++
++    Path(path).parent.mkdir(parents=True, exist_ok=True)
++    np.savez(path, **arrays)
++
++
++def is_cropped(npz) -> bool:
++    """True if the loaded npz uses the cropped strip schema."""
++    files = getattr(npz, "files", None)
++    if files is None:
++        return False
++    if "z_rows" in files and "z_cols" in files and "lig_idx" in files:
++        return True
++    return False
++
++
++def reconstruct_z_from_cropped(npz) -> np.ndarray:
++    """Rebuild the full zero-filled ``z`` [L, L, C] from cropped strips."""
++    z_rows = npz["z_rows"]  # [n_lig, L, C]
++    z_cols = npz["z_cols"]  # [L, n_lig, C]
++    lig_idx = npz["lig_idx"].astype(np.int64)
++    L = int(npz["L"])
++    C = z_rows.shape[-1]
++    if z_rows.shape != (lig_idx.size, L, C) or z_cols.shape != (L, lig_idx.size, C):
++        msg = (
++            "Cropped z strips inconsistent: "
++            f"z_rows={z_rows.shape}, z_cols={z_cols.shape}, "
++            f"lig_idx={lig_idx.size}, L={L}, C={C}"
++        )
++        raise ValueError(msg)
++    full = np.zeros((L, L, C), dtype=np.float32)
++    full[lig_idx, :, :] = z_rows
++    full[:, lig_idx, :] = z_cols  # lig-lig overlap is identical, safe to overwrite
++    return full
++
++
++def load_precomputed_z(path: Union[str, Path]) -> torch.Tensor:
++    """Load cropped or dense cached pairs as [1, L, L, C] float32."""
++    path = Path(path)
++    if not path.exists():
++        msg = f"Embedding cache not found: {path}"
++        raise FileNotFoundError(msg)
++    with np.load(path, allow_pickle=True) as npz:
++        if is_cropped(npz):
++            full = reconstruct_z_from_cropped(npz)  # [L, L, C]
++        elif "z" in getattr(npz, "files", []):
++            z = npz["z"]
++            full = z[0] if z.ndim == 4 else z  # [L, L, C]
++            full = np.ascontiguousarray(full, dtype=np.float32)
++        else:
++            msg = (
++                f"Embedding cache {path} has neither cropped strips "
++                f"(z_rows/z_cols/lig_idx) nor a full 'z' array."
++            )
++            raise KeyError(msg)
++    return torch.from_numpy(full).unsqueeze(0)  # [1, L, L, C]
++
++
++def save_affinity_cropped_inputs(
++    path: Union[str, Path],
++    *,
++    z: torch.Tensor,
++    s_inputs: torch.Tensor,
++    coords: torch.Tensor,
++    token_to_rep_atom: torch.Tensor,
++    token_pad_mask: torch.Tensor,
++    mol_type: torch.Tensor,
++    affinity_token_mask: torch.Tensor,
++    original_token_indices: Optional[torch.Tensor] = None,
++    affinity_mw: Optional[torch.Tensor] = None,
++) -> None:
++    """Store affinity inputs, omitting masked receptor-receptor pairs."""
++    z_np = _to_numpy(z)
++    if z_np.ndim == 4:
++        if z_np.shape[0] != 1:
++            raise ValueError(f"Expected one affinity sample, got z={z_np.shape}")
++        z_np = z_np[0]
++    if z_np.ndim != 3:
++        raise ValueError(f"Expected z [L,L,C], got {z_np.shape}")
++
++    def one(x: torch.Tensor) -> np.ndarray:
++        value = _to_numpy(x)
++        return value[0] if value.ndim > 0 and value.shape[0] == 1 else value
++
++    pad_raw = one(token_pad_mask)
++    pad = pad_raw.astype(bool)
++    lig = one(affinity_token_mask).astype(bool) & pad
++    lig_idx = np.flatnonzero(lig[: z_np.shape[0]]).astype(np.int64)
++    if lig_idx.size == 0:
++        raise ValueError("Affinity cache has no binder/ligand tokens")
++
++    L = z_np.shape[0]
++    token_to_rep = one(token_to_rep_atom)
++    if token_to_rep.shape[0] != L:
++        raise ValueError(
++            f"token_to_rep_atom token count {token_to_rep.shape[0]} != L={L}"
++        )
++    rep_atom_indices = token_to_rep.argmax(axis=1).astype(np.int64)
++    if not np.allclose(token_to_rep[np.arange(L), rep_atom_indices], 1.0):
++        raise ValueError("token_to_rep_atom is not a one-hot representative-atom map")
++    arrays = {
++        "format": np.array(AFFINITY_CROPPED_FORMAT),
++        "z_rows": np.ascontiguousarray(z_np[lig_idx], dtype=np.float32),
++        "z_cols": np.ascontiguousarray(z_np[:, lig_idx], dtype=np.float32),
++        "lig_idx": lig_idx,
++        "L": np.array(L, dtype=np.int64),
++        "s_inputs": np.ascontiguousarray(one(s_inputs), dtype=np.float32),
++        "coords": np.ascontiguousarray(_to_numpy(coords), dtype=np.float32),
++        "rep_atom_indices": rep_atom_indices,
++        "token_pad_mask": pad_raw[:L].astype(np.float32),
++        "mol_type": one(mol_type)[:L].astype(np.int64),
++        "affinity_token_mask": one(affinity_token_mask)[:L].astype(bool),
++        "affinity_token_indices": np.arange(L, dtype=np.int64),
++    }
++    if original_token_indices is not None:
++        arrays["original_token_indices"] = one(original_token_indices)[:L].astype(
++            np.int64
++        )
++    if affinity_mw is not None:
++        arrays["affinity_mw"] = _to_numpy(affinity_mw).astype(np.float32)
++
++    Path(path).parent.mkdir(parents=True, exist_ok=True)
++    np.savez(path, **arrays)
++
++
++def load_affinity_cropped_inputs(path: Union[str, Path]) -> dict[str, torch.Tensor]:
++    """Load and validate a self-contained ``affinity_cropped_v1`` cache."""
++    path = Path(path)
++    with np.load(path, allow_pickle=False) as npz:
++        fmt = str(npz["format"].item()) if "format" in npz.files else ""
++        if fmt != AFFINITY_CROPPED_FORMAT:
++            raise ValueError(
++                f"Expected format={AFFINITY_CROPPED_FORMAT}, got {fmt!r}: {path}"
++            )
++        full_z = reconstruct_z_from_cropped(npz)
++        L = int(npz["L"])
++        own_map = npz["affinity_token_indices"].astype(np.int64)
++        if not np.array_equal(own_map, np.arange(L, dtype=np.int64)):
++            raise ValueError(f"Invalid affinity token index map in {path}")
++        arrays = {key: np.array(npz[key]) for key in npz.files}
++
++    rep_atom_indices = arrays["rep_atom_indices"].astype(np.int64)
++    atom_count = arrays["coords"].shape[-2]
++    token_to_rep_atom = np.zeros((L, atom_count), dtype=np.float32)
++    token_to_rep_atom[np.arange(L), rep_atom_indices] = 1.0
++    out = {
++        "z": torch.from_numpy(full_z).unsqueeze(0),
++        "s_inputs": torch.from_numpy(arrays["s_inputs"]).unsqueeze(0),
++        "coords": torch.from_numpy(arrays["coords"]),
++        "token_to_rep_atom": torch.from_numpy(token_to_rep_atom).unsqueeze(0),
++        "token_pad_mask": torch.from_numpy(arrays["token_pad_mask"]).unsqueeze(0),
++        "mol_type": torch.from_numpy(arrays["mol_type"]).unsqueeze(0),
++        "affinity_token_mask": torch.from_numpy(
++            arrays["affinity_token_mask"]
++        ).unsqueeze(0),
++    }
++    if "affinity_mw" in arrays:
++        out["affinity_mw"] = torch.from_numpy(arrays["affinity_mw"])
++    return out
+diff --git a/src/boltz/data/module/trainingv3.py b/src/boltz/data/module/trainingv3.py
+index 0a22f4c..fa0627b 100644
+--- a/src/boltz/data/module/trainingv3.py
++++ b/src/boltz/data/module/trainingv3.py
+@@ -11,6 +11,7 @@ from torch import Tensor
+ from torch.utils.data import DataLoader
+ 
+ from boltz.data import const
++from boltz.data.crop_embeddings import load_precomputed_z
+ from boltz.data.crop.affinity import AffinityCropper
+ from boltz.data.crop.cropper import Cropper
+ from boltz.data.feature.featurizerv2 import Boltz2Featurizer
+@@ -77,6 +78,7 @@ class DataConfig:
+     val_batch_size: int = 1
+     compute_affinity: bool = False
+     embeddings_dir: Optional[str] = None
++    train_random_seed: Optional[int] = None
+ 
+ 
+ @dataclass
+@@ -95,6 +97,8 @@ class Dataset:
+     featurizer: Boltz2Featurizer
+ 
+ 
++
++
+ def load_input(
+     record: Record,
+     target_dir: Path,
+@@ -242,6 +246,7 @@ class TrainingDataset(torch.utils.data.Dataset):
+         return_symmetries: Optional[bool] = False,
+         compute_affinity: bool = False,
+         embeddings_dir: Optional[Path] = None,
++        random_seed: Optional[int] = None,
+     ) -> None:
+         """Initialize the training dataset."""
+         super().__init__()
+@@ -268,13 +273,16 @@ class TrainingDataset(torch.utils.data.Dataset):
+         self.return_symmetries = return_symmetries
+         self.compute_affinity = compute_affinity
+         self.embeddings_dir = embeddings_dir
++        self.random_seed = random_seed
+         self.samples = []
++        self.dataset_records = []
+         for dataset in datasets:
+             records = dataset.manifest.records
+             if overfit is not None:
+                 records = records[:overfit]
+             iterator = dataset.sampler.sample(records, np.random)
+             self.samples.append(iterator)
++            self.dataset_records.append(records)
+ 
+         # Initialize affinity cropper if needed
+         if self.compute_affinity:
+@@ -295,14 +303,23 @@ class TrainingDataset(torch.utils.data.Dataset):
+ 
+         """
+         # Pick a random dataset
+-        dataset_idx = np.random.choice(
++        random = (
++            np.random
++            if self.random_seed is None
++            else np.random.RandomState(self.random_seed + idx)
++        )
++        dataset_idx = random.choice(
+             len(self.datasets),
+             p=self.probs,
+         )
+         dataset = self.datasets[dataset_idx]
+ 
+         # Get a sample from the dataset
+-        sample: Sample = next(self.samples[dataset_idx])
++        sample: Sample = (
++            next(self.samples[dataset_idx])
++            if self.random_seed is None
++            else next(dataset.sampler.sample(self.dataset_records[dataset_idx], random))
++        )
+ 
+         # Get the structure
+         try:
+@@ -341,7 +358,7 @@ class TrainingDataset(torch.utils.data.Dataset):
+                     tokenized,
+                     max_atoms=self.max_atoms,
+                     max_tokens=self.max_tokens,
+-                    random=np.random,
++                    random=random if self.random_seed is not None else np.random,
+                     chain_id=sample.chain_id,
+                     interface_id=sample.interface_id,
+                 )
+@@ -369,7 +386,11 @@ class TrainingDataset(torch.utils.data.Dataset):
+             return self.__getitem__(idx)
+ 
+         # Create random generator
+-        random = np.random.default_rng()
++        random = (
++            np.random.default_rng()
++            if self.random_seed is None
++            else np.random.default_rng(self.random_seed + idx)
++        )
+ 
+         # Compute features
+         try:
+@@ -415,10 +436,8 @@ class TrainingDataset(torch.utils.data.Dataset):
+         features["record_id"] = sample.record.id  # Add record ID
+         if self.embeddings_dir is not None:
+             embeddings_path = self.embeddings_dir / f"embeddings_{sample.record.id}.npz"
+-            if embeddings_path.exists():
+-                embeddings = np.load(embeddings_path)
+-                features["precomputed_s"] = torch.from_numpy(embeddings["s"])
+-                features["precomputed_z"] = torch.from_numpy(embeddings["z"])
++            # A configured embedding cache is required for affinity-only inference.
++            features["precomputed_z"] = load_precomputed_z(embeddings_path)
+         return features
+ 
+     def __len__(self) -> int:
+@@ -632,10 +651,8 @@ class ValidationDataset(torch.utils.data.Dataset):
+         features["record_id"] = record.id
+         if self.embeddings_dir is not None:
+             embeddings_path = self.embeddings_dir / f"embeddings_{record.id}.npz"
+-            if embeddings_path.exists():
+-                embeddings = np.load(embeddings_path)
+-                features["precomputed_s"] = torch.from_numpy(embeddings["s"])
+-                features["precomputed_z"] = torch.from_numpy(embeddings["z"])
++            # A configured embedding cache is required for affinity-only inference.
++            features["precomputed_z"] = load_precomputed_z(embeddings_path)
+ 
+         return features
+ 
+@@ -796,6 +813,7 @@ class BoltzTrainingDataModule(pl.LightningDataModule):
+             return_symmetries=cfg.return_train_symmetries,
+             compute_affinity=cfg.compute_affinity,
+             embeddings_dir=Path(cfg.embeddings_dir) if cfg.embeddings_dir else None,
++            random_seed=cfg.train_random_seed,
+         )
+         self._val_set = ValidationDataset(
+             datasets=train if cfg.overfit is not None else val,
+diff --git a/src/boltz/data/parse/schema.py b/src/boltz/data/parse/schema.py
+index 9b7c469..ef06598 100644
+--- a/src/boltz/data/parse/schema.py
++++ b/src/boltz/data/parse/schema.py
+@@ -9,7 +9,7 @@ from Bio import Align
+ from chembl_structure_pipeline.exclude_flag import exclude_flag
+ from chembl_structure_pipeline.standardizer import standardize_mol
+ from rdkit import Chem, rdBase
+-from rdkit.Chem import AllChem, HybridizationType
++from rdkit.Chem import AllChem, Descriptors, HybridizationType
+ from rdkit.Chem.MolStandardize import rdMolStandardize
+ from rdkit.Chem.rdchem import BondStereo, Conformer, Mol
+ from rdkit.Chem.rdDistGeom import GetMoleculeBoundsMatrix
+@@ -162,7 +162,7 @@ class ParsedChain:
+     affinity_mw: Optional[float] = None
+     # NEW FIELDS:
+     affinity_value: Optional[float] = None
+-    affinity_is_binder: Optional[int] = None
++    affinity_is_binder: Optional[float] = None  # 0/1 hard label or soft target in [0, 1]
+     affinity_assay_id: Optional[str] = None
+     affinity_measurement_type: Optional[str] = None
+     affinity_confidence: float = 1.0
+@@ -1229,7 +1229,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
+                 ref_mol = get_mol(code, ccd, mol_dir)
+ 
+                 if affinity:
+-                    affinity_mw = AllChem.Descriptors.MolWt(ref_mol)
++                    affinity_mw = Descriptors.MolWt(ref_mol)
+ 
+                     # Add error and warning messaging when computing affinity with ligands too large
+                     if ref_mol.GetNumAtoms() > 128:
+@@ -1307,7 +1307,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
+                     print("WARNING: the ligand used for affinity calculation is larger than 56 heavy-atoms, "
+                           "which was the maximum during training, therefore the affinity output might be inaccurate.")
+ 
+-            affinity_mw = AllChem.Descriptors.MolWt(mol_no_h) if affinity else None
++            affinity_mw = Descriptors.MolWt(mol_no_h) if affinity else None
+             extra_mols[f"LIG{ligand_id}"] = mol_no_h
+             residue = parse_ccd_residue(
+                 name=f"LIG{ligand_id}",
+diff --git a/src/boltz/data/types.py b/src/boltz/data/types.py
+index 7696d98..f125609 100644
+--- a/src/boltz/data/types.py
++++ b/src/boltz/data/types.py
+@@ -570,7 +570,7 @@ class AffinityInfo:
+     mw: float
+     # NEW FIELDS:
+     value: Optional[float] = None
+-    is_binder: Optional[int] = None
++    is_binder: Optional[float] = None  # 0/1 hard label or soft target in [0, 1]
+     assay_id: Optional[str] = None
+     measurement_type: Optional[str] = None
+     confidence: float = 1.0
+diff --git a/src/boltz/data/write/writer.py b/src/boltz/data/write/writer.py
+index 984be2a..965248b 100644
+--- a/src/boltz/data/write/writer.py
++++ b/src/boltz/data/write/writer.py
+@@ -9,6 +9,7 @@ from pytorch_lightning import LightningModule, Trainer
+ from pytorch_lightning.callbacks import BasePredictionWriter
+ from torch import Tensor
+ 
++from boltz.data.crop_embeddings import save_affinity_cropped_inputs, save_cropped_z
+ from boltz.data.types import Coords, Interface, Record, Structure, StructureV2
+ from boltz.data.write.mmcif import to_mmcif
+ from boltz.data.write.pdb import to_pdb
+@@ -24,6 +25,7 @@ class BoltzWriter(BasePredictionWriter):
+         output_format: Literal["pdb", "mmcif"] = "mmcif",
+         boltz2: bool = False,
+         write_embeddings: bool = False,
++        write_embeddings_cropped: bool = False,
+     ) -> None:
+         """Initialize the writer.
+ 
+@@ -31,6 +33,13 @@ class BoltzWriter(BasePredictionWriter):
+         ----------
+         output_dir : str
+             The directory to save the predictions.
++        write_embeddings_cropped : bool
++            If True, save the ligand-incident strips of the trunk ``z`` (rec-rec
++            block dropped) to ``embeddings_<id>.npz`` for affinity-only inference
++            / head-FT. ~4x smaller than the full ``z`` and numerically equivalent
++            because the affinity module masks rec-rec anyway. The cache stays in
++            the original (uncropped) token space so the existing precomputed_z
++            alignment (original_token_indices) works unchanged at reload.
+ 
+         """
+         super().__init__(write_interval="batch")
+@@ -45,6 +54,7 @@ class BoltzWriter(BasePredictionWriter):
+         self.boltz2 = boltz2
+         self.output_dir.mkdir(parents=True, exist_ok=True)
+         self.write_embeddings = write_embeddings
++        self.write_embeddings_cropped = write_embeddings_cropped
+ 
+     def write_on_batch_end(
+         self,
+@@ -247,7 +257,20 @@ class BoltzWriter(BasePredictionWriter):
+                     np.savez_compressed(path, pde=pde.cpu().numpy())
+                 
+             # Save embeddings
+-            if self.write_embeddings and "s" in prediction and "z" in prediction:
++            if self.write_embeddings_cropped and "z" in prediction:
++                # Retain non-protein pair strips in the original token order.
++                keep = batch.get("affinity_token_mask")
++                if keep is None:
++                    keep = (batch["mol_type"] != 0)
++                path = struct_dir / f"embeddings_{record.id}.npz"
++                save_cropped_z(
++                    path,
++                    z=prediction["z"],
++                    keep_token_mask=keep,
++                    token_pad_mask=batch.get("token_pad_mask"),
++                    original_token_indices=batch.get("original_token_indices"),
++                )
++            elif self.write_embeddings and "s" in prediction and "z" in prediction:
+                 s = prediction["s"].cpu().numpy()
+                 z = prediction["z"].cpu().numpy()
+ 
+@@ -274,6 +297,7 @@ class BoltzAffinityWriter(BasePredictionWriter):
+         self,
+         data_dir: str,
+         output_dir: str,
++        write_embeddings_cropped: bool = False,
+     ) -> None:
+         """Initialize the writer.
+ 
+@@ -287,6 +311,7 @@ class BoltzAffinityWriter(BasePredictionWriter):
+         self.failed = 0
+         self.data_dir = Path(data_dir)
+         self.output_dir = Path(output_dir)
++        self.write_embeddings_cropped = write_embeddings_cropped
+         self.output_dir.mkdir(parents=True, exist_ok=True)
+ 
+     def write_on_batch_end(
+@@ -333,6 +358,46 @@ class BoltzAffinityWriter(BasePredictionWriter):
+         with path.open("w") as f:
+             f.write(json.dumps(affinity_summary, indent=4))
+ 
++        if self.write_embeddings_cropped:
++            required = (
++                "affinity_cache_z",
++                "affinity_cache_s_inputs",
++                "affinity_cache_coords",
++            )
++            missing = [key for key in required if key not in prediction]
++            if missing:
++                raise KeyError(f"Missing affinity cache outputs: {missing}")
++            cache_path = struct_dir / f"affinity_embeddings_{batch['record'][0].id}.npz"
++            save_affinity_cropped_inputs(
++                cache_path,
++                z=prediction["affinity_cache_z"],
++                s_inputs=prediction["affinity_cache_s_inputs"],
++                coords=prediction["affinity_cache_coords"],
++                token_to_rep_atom=batch["token_to_rep_atom"],
++                token_pad_mask=batch["token_pad_mask"],
++                mol_type=batch["mol_type"],
++                affinity_token_mask=batch["affinity_token_mask"],
++                original_token_indices=batch.get("original_token_indices"),
++                affinity_mw=batch.get("affinity_mw"),
++            )
++
++        feature_keys = [
++            "affinity_g_raw",
++            "affinity_g_after_affinity_out_mlp",
++            "affinity_g_raw1",
++            "affinity_g_after_affinity_out_mlp1",
++            "affinity_g_raw2",
++            "affinity_g_after_affinity_out_mlp2",
++        ]
++        affinity_features = {
++            key: prediction[key].detach().cpu().numpy()
++            for key in feature_keys
++            if key in prediction
++        }
++        if affinity_features:
++            feature_path = struct_dir / f"affinity_features_{batch['record'][0].id}.npz"
++            np.savez_compressed(feature_path, **affinity_features)
++
+     def on_predict_epoch_end(
+         self,
+         trainer: Trainer,  # noqa: ARG002
+diff --git a/src/boltz/main.py b/src/boltz/main.py
+index 96c7a78..893afba 100644
+--- a/src/boltz/main.py
++++ b/src/boltz/main.py
+@@ -1039,6 +1039,53 @@ def cli() -> None:
+     is_flag=True,
+     help=" to dump the s and z embeddings into a npz file. Default is False.",
+ )
++@click.option(
++    "--write_embeddings_cropped",
++    is_flag=True,
++    help=(
++        "Dump only the ligand-incident strips of the trunk z (rec-rec block "
++        "dropped) to embeddings_<id>.npz, for affinity-only inference / head-FT. "
++        "~4x smaller than --write_embeddings and numerically equivalent because "
++        "the affinity module masks rec-rec anyway. Default is False."
++    ),
++)
++@click.option(
++    "--skip_affinity_prediction",
++    is_flag=True,
++    help=(
++        "Skip the affinity prediction pass entirely (only run trunk+structure). "
++        "Use with --write_embeddings_cropped to store training representations. "
++        "The YAML affinity annotation identifies the ligand tokens."
++    ),
++)
++@click.option(
++    "--write_affinity_embeddings_cropped",
++    is_flag=True,
++    help=(
++        "Write self-contained affinity_cropped_v1 head inputs from the affinity "
++        "pass to affinity_embeddings_<id>.npz."
++    ),
++)
++@click.option(
++    "--affinity_skip_run_structure/--affinity_run_structure",
++    default=False,
++    help=(
++        "Skip/run diffusion inside the affinity pass. Skipping feeds the affinity "
++        "head the input (stage-1) pose; running it re-diffuses "
++        "diffusion_samples_affinity poses and feeds the best one by ipTM. "
++    ),
++)
++@click.option(
++    "--reuse_pre_affinity_dir",
++    type=click.Path(exists=True, path_type=Path),
++    default=None,
++    help=(
++        "Skip the structure-prediction pass and reuse existing "
++        "pre_affinity_<id>.npz files from this flat directory (e.g. a previous "
++        "run's consolidated structures/). They are linked into "
++        "<out_dir>/predictions/<id>/ so the affinity pass reads them unchanged. "
++    ),
++)
+ def predict(  # noqa: C901, PLR0915, PLR0912
+     data: str,
+     out_dir: str,
+@@ -1077,6 +1124,11 @@ def predict(  # noqa: C901, PLR0915, PLR0912
+     num_subsampled_msa: int = 1024,
+     no_kernels: bool = False,
+     write_embeddings: bool = False,
++    write_embeddings_cropped: bool = False,
++    skip_affinity_prediction: bool = False,
++    write_affinity_embeddings_cropped: bool = False,
++    affinity_skip_run_structure: bool = False,
++    reuse_pre_affinity_dir: Optional[Path] = None,
+ ) -> None:
+     """Run predictions with Boltz."""
+     # If cpu, write a friendly warning
+@@ -1250,6 +1302,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
+         output_format=output_format,
+         boltz2=model == "boltz2",
+         write_embeddings=write_embeddings,
++        write_embeddings_cropped=write_embeddings_cropped,
+     )
+ 
+     # Set up trainer
+@@ -1262,7 +1315,34 @@ def predict(  # noqa: C901, PLR0915, PLR0912
+         precision=32 if model == "boltz1" else "bf16-mixed",
+     )
+ 
+-    if filtered_manifest.records:
++    if reuse_pre_affinity_dir is not None:
++        # Link stored poses to the filenames expected by the affinity data module.
++        linked = 0
++        missing = []
++        for record in manifest.records:
++            src = reuse_pre_affinity_dir / f"pre_affinity_{record.id}.npz"
++            if not src.exists():
++                missing.append(record.id)
++                continue
++            dst_dir = out_dir / "predictions" / record.id
++            dst_dir.mkdir(parents=True, exist_ok=True)
++            dst = dst_dir / f"pre_affinity_{record.id}.npz"
++            if not dst.exists():
++                dst.symlink_to(src.resolve())
++            linked += 1
++        if missing:
++            msg = (
++                f"--reuse_pre_affinity_dir is missing {len(missing)} of "
++                f"{len(manifest.records)} pre_affinity files (first: {missing[0]}). "
++                "Refusing to run: a partially reused set would silently mix poses "
++                "from two different structure passes."
++            )
++            raise click.ClickException(msg)
++        click.echo(
++            f"Reusing {linked} existing poses from {reuse_pre_affinity_dir}; "
++            "skipping structure prediction."
++        )
++    elif filtered_manifest.records:
+         msg = f"Running structure prediction for {len(filtered_manifest.records)} input"
+         msg += "s." if len(filtered_manifest.records) > 1 else "."
+         click.echo(msg)
+@@ -1333,7 +1413,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
+         )
+ 
+     # Check if affinity predictions are needed
+-    if any(r.affinity for r in manifest.records):
++    if skip_affinity_prediction:
++        click.echo("\nSkipping affinity prediction pass (--skip_affinity_prediction).")
++    elif any(r.affinity for r in manifest.records):
+         # Print header
+         click.echo("\nPredicting property: affinity\n")
+ 
+@@ -1354,6 +1436,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
+         pred_writer = BoltzAffinityWriter(
+             data_dir=processed.targets_dir,
+             output_dir=out_dir / "predictions",
++            write_embeddings_cropped=write_affinity_embeddings_cropped,
+         )
+ 
+         data_module = Boltz2InferenceDataModule(
+@@ -1378,6 +1461,13 @@ def predict(  # noqa: C901, PLR0915, PLR0912
+             "write_full_pae": False,
+             "write_full_pde": False,
+         }
++        if write_affinity_embeddings_cropped:
++            # Request cache tensors for BoltzAffinityWriter.
++            predict_affinity_args["keys_dict_out"] = [
++                "affinity_cache_z",
++                "affinity_cache_s_inputs",
++                "affinity_cache_coords",
++            ]
+ 
+         # Load affinity model
+         if affinity_checkpoint is None:
+@@ -1400,7 +1490,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
+             steering_args=asdict(steering_args),
+             affinity_mw_correction=affinity_mw_correction,
+             run_trunk_and_structure=True,  # Override the affinity fintunning: compute embeddings
+-            skip_run_structure=False,  # Override: run structure diffusion
++            skip_run_structure=affinity_skip_run_structure,
+             confidence_prediction=True,  # Override: enable confidence
+         )
+         model_module.eval()
+diff --git a/src/boltz/model/models/boltz2.py b/src/boltz/model/models/boltz2.py
+index 7e59df5..4c05153 100644
+--- a/src/boltz/model/models/boltz2.py
++++ b/src/boltz/model/models/boltz2.py
+@@ -602,7 +602,10 @@ class Boltz2(LightningModule):
+                 feats["coords"] = feats["coords"].squeeze(1)
+                 assert len(feats["coords"].shape) == 3
+ 
+-        if self.confidence_prediction:
++        run_confidence_prediction = self.confidence_prediction and (
++            (not self.training) or self.training_args.confidence_loss_weight > 0
++        )
++        if run_confidence_prediction:
+             dict_out.update(
+                 self.confidence_module(
+                     s_inputs=s_inputs.detach(),
+@@ -652,68 +655,59 @@ class Boltz2(LightningModule):
+                         f"Expected [B, N, N, C] or [B, 1, N, N, C]."
+                     )
+ 
+-                # Crop precomputed_z to match affinity-cropped tokens
+-                # The token_idx field is preserved after cropping
+-                pad_mask = feats["token_pad_mask"][0].bool()
+-                n_current_tokens = pad_mask.sum().item()
+-                z_size = z_precomputed.shape[1]  # Now gets N from [B, N, N, C]
+-
+-                if z_size != n_current_tokens and "original_token_indices" in feats:
+-                    # Cropping needed: extract subset from precomputed_z and handle padding
+-                    # Training uses padding (pad_to_max_tokens=True), validation doesn't
+-                    original_indices = feats["original_token_indices"][0]  # [max_tokens] or [n_tokens]
+-                    actual_indices = original_indices[pad_mask]  # [n_current_tokens] - token_idx values
+-
+-                    max_idx = actual_indices.max().item() if len(actual_indices) > 0 else -1
+-                    min_idx = actual_indices.min().item() if len(actual_indices) > 0 else -1
+-
+-                    if max_idx >= z_size:
+-                        raise ValueError(
+-                            f"Token index out of bounds during affinity cropping:\n"
+-                            f"  - Ensure NO cropper is used during embedding generation\n"
+-                        )
+-
+-                    # Check if feats are padded
+-                    max_tokens = len(original_indices)
+-                    if max_tokens > n_current_tokens:
+-                        # Feats are PADDED (training mode pad_to_max_tokens=True)
+-                        # Create z at padded size to match feats dimensions
+-                        B, C = z_precomputed.shape[0], z_precomputed.shape[-1]
+-                        z = torch.zeros(
+-                            (B, max_tokens, max_tokens, C),
+-                            device=z_precomputed.device,
+-                            dtype=z_precomputed.dtype,
+-                        )
++                # Align unpadded cached pairs with the padded training features.
++                pad_mask = feats["token_pad_mask"].bool()
++                target_tokens = pad_mask.shape[1]
++                z_size = z_precomputed.shape[1]
+ 
+-                        # Extract cropped subset from precomputed_z
+-                        z_cropped = z_precomputed[:, actual_indices, :, :][:, :, actual_indices, :] # shape: [B, n_current_tokens, n_current_tokens, C]
+-
+-                        # Place cropped values at correct positions in padded tensor where pad_mask is True
+-                        pad_indices = torch.where(pad_mask)[0]
+-                        for b in range(B):
+-                            z[b, pad_indices[:, None], pad_indices[None, :], :] = z_cropped[b]
+-                    else:
+-                        # Feats are not padded (validation mode) and directly crop z to match the cropped feature size
+-                        z = z_precomputed[:, actual_indices, :, :]  # Crop rows
+-                        z = z[:, :, actual_indices, :]  # Crop columns
+-                elif z_size == n_current_tokens:
+-                    # Sizes match - no cropping needed
++                if z_size == target_tokens:
+                     z = z_precomputed
+                 else:
+-                    # No original_token_indices available here
+-                    z = z_precomputed
++                    B, C = z_precomputed.shape[0], z_precomputed.shape[-1]
++                    z = torch.zeros(
++                        (B, target_tokens, target_tokens, C),
++                        device=z_precomputed.device,
++                        dtype=z_precomputed.dtype,
++                    )
++                    original_indices = feats.get("original_token_indices")
++
++                    for b in range(B):
++                        valid_positions = torch.where(pad_mask[b])[0]
++                        n_valid = valid_positions.numel()
++                        if n_valid == 0:
++                            continue
++
++                        actual_indices = None
++                        if original_indices is not None:
++                            candidate = original_indices[b][valid_positions].long()
++                            if candidate.numel() and int(candidate.max().item()) < z_size:
++                                actual_indices = candidate
++
++                        if actual_indices is not None:
++                            z_cropped = z_precomputed[b][actual_indices, :, :]
++                            z_cropped = z_cropped[:, actual_indices, :]
++                        elif z_size >= n_valid:
++                            z_cropped = z_precomputed[b, :n_valid, :n_valid, :]
++                        else:
++                            raise ValueError(
++                                "Cannot align precomputed_z to affinity features: "
++                                f"z_size={z_size}, target_tokens={target_tokens}, "
++                                f"valid_tokens={int(n_valid)}"
++                            )
++
++                        z[b, valid_positions[:, None], valid_positions[None, :], :] = (
++                            z_cropped
++                        )
+ 
+-            pad_token_mask = feats["token_pad_mask"][0]
+-            rec_mask = feats["mol_type"][0] == 0
+-            rec_mask = rec_mask * pad_token_mask
+-            lig_mask = feats["affinity_token_mask"][0].to(torch.bool)
+-            lig_mask = lig_mask * pad_token_mask
++            pad_token_mask = feats["token_pad_mask"].to(torch.bool)
++            rec_mask = (feats["mol_type"] == 0) * pad_token_mask
++            lig_mask = feats["affinity_token_mask"].to(torch.bool) * pad_token_mask
+             cross_pair_mask = (
+-                lig_mask[:, None] * rec_mask[None, :]
+-                + rec_mask[:, None] * lig_mask[None, :]
+-                + lig_mask[:, None] * lig_mask[None, :]
++                lig_mask[:, :, None] * rec_mask[:, None, :]
++                + rec_mask[:, :, None] * lig_mask[:, None, :]
++                + lig_mask[:, :, None] * lig_mask[:, None, :]
+             )
+-            z_affinity = z * cross_pair_mask[None, :, :, None]
++            z_affinity = z * cross_pair_mask[:, :, :, None]
+ 
+             # Get coordinates for affinity prediction
+             if "sample_atom_coords" in dict_out:
+@@ -728,6 +722,11 @@ class Boltz2(LightningModule):
+ 
+             s_inputs = self.input_embedder(feats, affinity=True)
+ 
++            # Export affinity inputs in their current token order.
++            dict_out["affinity_cache_z"] = z_affinity.detach()
++            dict_out["affinity_cache_s_inputs"] = s_inputs.detach()
++            dict_out["affinity_cache_coords"] = coords_affinity.detach()
++
+             with torch.autocast("cuda", enabled=False):
+                 if self.affinity_ensemble:
+                     dict_out_affinity1 = self.affinity_module1(
+@@ -769,6 +768,16 @@ class Boltz2(LightningModule):
+                             + dict_out_affinity2["affinity_probability_binary"]
+                         )
+                         / 2,
++                        "affinity_g_raw": (
++                            dict_out_affinity1["affinity_g_raw"]
++                            + dict_out_affinity2["affinity_g_raw"]
++                        )
++                        / 2,
++                        "affinity_g_after_affinity_out_mlp": (
++                            dict_out_affinity1["affinity_g_after_affinity_out_mlp"]
++                            + dict_out_affinity2["affinity_g_after_affinity_out_mlp"]
++                        )
++                        / 2,
+                     }
+                     # Add logits for loss computation
+                     dict_out_affinity1 = {
+@@ -779,6 +788,10 @@ class Boltz2(LightningModule):
+                             "affinity_probability_binary"
+                         ],
+                         "affinity_logits_binary1": dict_out_affinity1["affinity_logits_binary"],
++                        "affinity_g_raw1": dict_out_affinity1["affinity_g_raw"],
++                        "affinity_g_after_affinity_out_mlp1": dict_out_affinity1[
++                            "affinity_g_after_affinity_out_mlp"
++                        ],
+                     }
+                     dict_out_affinity2 = {
+                         "affinity_pred_value2": dict_out_affinity2[
+@@ -788,6 +801,10 @@ class Boltz2(LightningModule):
+                             "affinity_probability_binary"
+                         ],
+                         "affinity_logits_binary2": dict_out_affinity2["affinity_logits_binary"],
++                        "affinity_g_raw2": dict_out_affinity2["affinity_g_raw"],
++                        "affinity_g_after_affinity_out_mlp2": dict_out_affinity2[
++                            "affinity_g_after_affinity_out_mlp"
++                        ],
+                     }
+                     if self.affinity_mw_correction:
+                         model_coef = 1.03525938
+@@ -825,6 +842,10 @@ class Boltz2(LightningModule):
+                             "affinity_probability_binary": torch.nn.functional.sigmoid(
+                                 dict_out_affinity["affinity_logits_binary"]
+                             ),
++                            "affinity_g_raw": dict_out_affinity["affinity_g_raw"],
++                            "affinity_g_after_affinity_out_mlp": dict_out_affinity[
++                                "affinity_g_after_affinity_out_mlp"
++                            ],
+                         }
+                     )
+ 
+@@ -1016,9 +1037,13 @@ class Boltz2(LightningModule):
+         # MODIFICATION: Integrate affinity loss into training
+         # Compute affinity loss if affinity prediction is enabled and labels present
+         if self.affinity_prediction:
++            # Either continuous or binary labels contribute to the affinity loss.
+             has_affinity_labels = (
+                     "affinity_target_value" in batch and
+                     batch.get("affinity_target_mask", torch.tensor(0.0)).sum().item() > 0
++            ) or (
++                    "binary_target" in batch and
++                    batch.get("binary_target_mask", torch.tensor(0.0)).sum().item() > 0
+             )
+ 
+             if has_affinity_labels:
+@@ -1037,7 +1062,7 @@ class Boltz2(LightningModule):
+                     affinity_loss1, affinity_loss_dict1 = affinity_loss(
+                         output=dict_out_affinity1,
+                         feats=batch,
+-                        focal_alpha=0.8,  # binder-to-decoy weighting for model 1
++                        focal_alpha=self.training_args.get("affinity_focal_alpha1", 0.8),  # binder-to-decoy weighting for model 1
+                         absolute_weight=self.training_args.get("affinity_absolute_weight", 1.0),
+                         pairwise_weight=self.training_args.get("affinity_pairwise_weight", 2.0),
+                         binary_weight=self.training_args.get("affinity_binary_weight", 1.0),
+@@ -1051,7 +1076,7 @@ class Boltz2(LightningModule):
+                     affinity_loss2, affinity_loss_dict2 = affinity_loss(
+                         output=dict_out_affinity2,
+                         feats=batch,
+-                        focal_alpha=0.6,  # binder-to-decoy weighting for model 2
++                        focal_alpha=self.training_args.get("affinity_focal_alpha2", 0.6),  # binder-to-decoy weighting for model 2
+                         absolute_weight=self.training_args.get("affinity_absolute_weight", 1.0),
+                         pairwise_weight=self.training_args.get("affinity_pairwise_weight", 2.0),
+                         binary_weight=self.training_args.get("affinity_binary_weight", 1.0),
+@@ -1262,16 +1287,27 @@ class Boltz2(LightningModule):
+                 )
+                 # NEW: Add affinity validation metrics
+                 if self.affinity_prediction:
++                    # Collect predictions for either label type.
+                     has_affinity_labels = (
+                             "affinity_target_value" in batch and
+                             batch.get("affinity_target_mask",
+                                       torch.tensor(0.0)).sum().item() > 0
++                    ) or (
++                            "binary_target" in batch and
++                            batch.get("binary_target_mask",
++                                      torch.tensor(0.0)).sum().item() > 0
+                     )
+ 
+                     if has_affinity_labels:
+                         affinity_pred = out.get("affinity_pred_value")
+                         affinity_target = batch["affinity_target_value"]
+                         affinity_mask = batch["affinity_target_mask"].bool()
++                        binary_target = batch.get(
++                            "binary_target", torch.zeros_like(affinity_target)
++                        )
++                        binary_mask = batch.get(
++                            "binary_target_mask", torch.zeros_like(affinity_target)
++                        ).bool()
+ 
+                         if affinity_mask.any():
+                             mae = torch.abs(affinity_pred[affinity_mask] - affinity_target[affinity_mask]).mean()
+@@ -1279,44 +1315,49 @@ class Boltz2(LightningModule):
+                             self.log("val/affinity_mae", mae, sync_dist=True)
+                             self.log("val/affinity_rmse", rmse, sync_dist=True)
+ 
+-                            # NOTE: Pearson correlation CANNOT be computed per-batch with batch_size=1
+-                            # We accumulate all predictions and compute at epoch end
+-
+-                            # Save predictions for later export
+-                            record_id = batch.get("record_id", batch.get("id", f"sample_{batch_idx}"))
+-                            if isinstance(record_id, (list, tuple)):
+-                                record_id = record_id[0]
+-                            if isinstance(record_id, torch.Tensor):
+-                                record_id = record_id.item() if record_id.numel() == 1 else record_id[0].item()
+-
+-                            # Store predictions for this batch
+-                            for i, (pred, target, mask) in enumerate(zip(
+-                                    affinity_pred.cpu().numpy(),
+-                                    affinity_target.cpu().numpy(),
+-                                    affinity_mask.cpu().numpy()
+-                            )):
+-                                if mask:
+-                                    pred1 = out.get("affinity_pred_value1")
+-                                    pred2 = out.get("affinity_pred_value2")
+-                                    prob_binary = out.get("affinity_probability_binary")
+-
+-                                    pred_dict = {
+-                                        "sample_id": str(record_id),
+-                                        "affinity_pred": float(pred),
+-                                        "affinity_target": float(target),
+-                                        "affinity_error": float(pred - target),
+-                                        "affinity_abs_error": float(abs(pred - target)),
+-                                    }
+-
+-                                    # Add ensemble predictions if available
+-                                    if pred1 is not None and self.affinity_ensemble:
+-                                        pred_dict["affinity_pred_model1"] = float(pred1[i].cpu().numpy())
+-                                    if pred2 is not None and self.affinity_ensemble:
+-                                        pred_dict["affinity_pred_model2"] = float(pred2[i].cpu().numpy())
+-                                    if prob_binary is not None:
+-                                        pred_dict["affinity_probability_binary"] = float(prob_binary[i].cpu().numpy())
+-
+-                                    self.validation_predictions.append(pred_dict)
++                        # Accumulate predictions for epoch-level metrics.
++                        record_id = batch.get("record_id", batch.get("id", f"sample_{batch_idx}"))
++                        if isinstance(record_id, (list, tuple)):
++                            record_id = record_id[0]
++                        if isinstance(record_id, torch.Tensor):
++                            record_id = record_id.item() if record_id.numel() == 1 else record_id[0].item()
++
++                        pred1 = out.get("affinity_pred_value1")
++                        pred2 = out.get("affinity_pred_value2")
++                        prob_binary = out.get("affinity_probability_binary")
++                        prob_binary1 = out.get("affinity_probability_binary1")
++                        prob_binary2 = out.get("affinity_probability_binary2")
++
++                        collect_mask = (affinity_mask | binary_mask).cpu().numpy()
++                        ap = affinity_pred.detach().cpu().numpy()
++                        at = affinity_target.detach().cpu().numpy()
++                        am = affinity_mask.cpu().numpy()
++                        bm = binary_mask.cpu().numpy()
++                        bt = binary_target.detach().cpu().numpy()
++                        for i in range(len(collect_mask)):
++                            if not collect_mask[i]:
++                                continue
++                            pred_dict = {
++                                "sample_id": str(record_id),
++                                "affinity_pred": float(ap[i]),
++                            }
++                            if am[i]:
++                                pred_dict["affinity_target"] = float(at[i])
++                                pred_dict["affinity_error"] = float(ap[i] - at[i])
++                                pred_dict["affinity_abs_error"] = float(abs(ap[i] - at[i]))
++                            if bm[i]:
++                                pred_dict["binary_target"] = float(bt[i])
++                            if pred1 is not None and self.affinity_ensemble:
++                                pred_dict["affinity_pred_model1"] = float(pred1[i].cpu().numpy())
++                            if pred2 is not None and self.affinity_ensemble:
++                                pred_dict["affinity_pred_model2"] = float(pred2[i].cpu().numpy())
++                            if prob_binary is not None:
++                                pred_dict["affinity_probability_binary"] = float(prob_binary[i].cpu().numpy())
++                            if prob_binary1 is not None and self.affinity_ensemble:
++                                pred_dict["affinity_probability_binary1"] = float(prob_binary1[i].cpu().numpy())
++                            if prob_binary2 is not None and self.affinity_ensemble:
++                                pred_dict["affinity_probability_binary2"] = float(prob_binary2[i].cpu().numpy())
++                            self.validation_predictions.append(pred_dict)
+             except RuntimeError as e:  # catch out of memory exceptions
+                 idx_dataset = batch["idx_dataset"][0].item()
+                 if "out of memory" in str(e):
+@@ -1334,9 +1375,14 @@ class Boltz2(LightningModule):
+         if len(predictions_list) == 0:
+             return None
+ 
++        # Regression metrics require at least two continuous targets.
++        with_target = [p for p in predictions_list if 'affinity_target' in p]
++        if len(with_target) < 2:
++            return None
++
+         # Extract predictions from this GPU
+-        preds = torch.tensor([p['affinity_pred'] for p in predictions_list]).to(self.device)
+-        targets = torch.tensor([p['affinity_target'] for p in predictions_list]).to(self.device)
++        preds = torch.tensor([p['affinity_pred'] for p in with_target]).to(self.device)
++        targets = torch.tensor([p['affinity_target'] for p in with_target]).to(self.device)
+ 
+         # Gather from all GPUs if using DDP
+         if self.trainer.world_size > 1:
+@@ -1387,17 +1433,21 @@ class Boltz2(LightningModule):
+                 self.log("val/affinity_epoch_mae", metrics['mae'], rank_zero_only=True)
+                 self.log("val/affinity_epoch_rmse", metrics['rmse'], rank_zero_only=True)
+ 
+-                # Save predictions to CSV
+-                if self.trainer.is_global_zero:
+-                    output_dir = Path(self.trainer.default_root_dir) / "validation_predictions"
+-                    output_dir.mkdir(exist_ok=True, parents=True)
+-                    csv_path = output_dir / f"val_predictions_epoch_{self.current_epoch}.csv"
+-
+-                    fieldnames = list(self.validation_predictions[0].keys())
+-                    with open(csv_path, 'w', newline='') as csvfile:
+-                        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+-                        writer.writeheader()
+-                        writer.writerows(self.validation_predictions)
++            # Save predictions even when correlation metrics are undefined (e.g. n=1).
++            if self.trainer.is_global_zero:
++                output_dir = Path(self.trainer.default_root_dir) / "validation_predictions"
++                output_dir.mkdir(exist_ok=True, parents=True)
++                csv_path = output_dir / f"val_predictions_epoch_{self.current_epoch}.csv"
++
++                fieldnames = []
++                for row in self.validation_predictions:
++                    for key in row:
++                        if key not in fieldnames:
++                            fieldnames.append(key)
++                with open(csv_path, 'w', newline='') as csvfile:
++                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
++                    writer.writeheader()
++                    writer.writerows(self.validation_predictions)
+ 
+             # Clear predictions for next epoch
+             self.validation_predictions = []
+@@ -1425,7 +1475,13 @@ class Boltz2(LightningModule):
+             if "keys_dict_out" in self.predict_args:
+                 for key in self.predict_args["keys_dict_out"]:
+                     pred_dict[key] = out[key]
+-            pred_dict["coords"] = out["sample_atom_coords"]
++            if "sample_atom_coords" in out:
++                pred_dict["coords"] = out["sample_atom_coords"]
++            else:
++                # Reuse input coordinates with the sample count expected by the writer.
++                pred_dict["coords"] = batch["coords"].repeat_interleave(
++                    self.predict_args["diffusion_samples"], 0
++                )
+             if self.confidence_prediction:
+                 # pred_dict["confidence"] = out.get("ablation_confidence", None)
+                 pred_dict["pde"] = out["pde"]
+@@ -1457,6 +1513,12 @@ class Boltz2(LightningModule):
+                 pred_dict["affinity_probability_binary"] = out[
+                     "affinity_probability_binary"
+                 ]
++                if "affinity_g_raw" in out:
++                    pred_dict["affinity_g_raw"] = out["affinity_g_raw"]
++                if "affinity_g_after_affinity_out_mlp" in out:
++                    pred_dict["affinity_g_after_affinity_out_mlp"] = out[
++                        "affinity_g_after_affinity_out_mlp"
++                    ]
+                 if self.affinity_ensemble:
+                     pred_dict["affinity_pred_value1"] = out["affinity_pred_value1"]
+                     pred_dict["affinity_probability_binary1"] = out[
+@@ -1466,6 +1528,18 @@ class Boltz2(LightningModule):
+                     pred_dict["affinity_probability_binary2"] = out[
+                         "affinity_probability_binary2"
+                     ]
++                    if "affinity_g_raw1" in out:
++                        pred_dict["affinity_g_raw1"] = out["affinity_g_raw1"]
++                    if "affinity_g_after_affinity_out_mlp1" in out:
++                        pred_dict["affinity_g_after_affinity_out_mlp1"] = out[
++                            "affinity_g_after_affinity_out_mlp1"
++                        ]
++                    if "affinity_g_raw2" in out:
++                        pred_dict["affinity_g_raw2"] = out["affinity_g_raw2"]
++                    if "affinity_g_after_affinity_out_mlp2" in out:
++                        pred_dict["affinity_g_after_affinity_out_mlp2"] = out[
++                            "affinity_g_after_affinity_out_mlp2"
++                        ]
+             return pred_dict
+ 
+         except RuntimeError as e:  # catch out of memory exceptions
+@@ -1563,7 +1637,10 @@ class Boltz2(LightningModule):
+ 
+         return optimizer
+ 
++
++
+     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
++
+         # Ignore the lr from the checkpoint
+         lr = self.training_args.max_lr
+         weight_decay = self.training_args.weight_decay
+diff --git a/src/boltz/model/modules/affinity.py b/src/boltz/model/modules/affinity.py
+index da14e3e..7f77d62 100644
+--- a/src/boltz/model/modules/affinity.py
++++ b/src/boltz/model/modules/affinity.py
+@@ -8,6 +8,12 @@ from boltz.model.modules.transformersv2 import DiffusionTransformer
+ from boltz.model.modules.utils import LinearNoBias
+ 
+ 
++
++
++
++
++
++
+ class GaussianSmearing(torch.nn.Module):
+     """Gaussian smearing."""
+ 
+@@ -205,11 +211,11 @@ class AffinityHeadsTransformer(nn.Module):
+             .unsqueeze(0)
+         )
+ 
+-        g = torch.sum(z * cross_pair_mask, dim=(1, 2)) / (
++        g_raw = torch.sum(z * cross_pair_mask, dim=(1, 2)) / (
+             torch.sum(cross_pair_mask, dim=(1, 2)) + 1e-7
+         )
+ 
+-        g = self.affinity_out_mlp(g)
++        g = self.affinity_out_mlp(g_raw)
+ 
+         affinity_pred_value = self.to_affinity_pred_value(g).reshape(-1, 1)
+         affinity_pred_score = self.to_affinity_pred_score(g).reshape(-1, 1)
+@@ -219,5 +225,7 @@ class AffinityHeadsTransformer(nn.Module):
+         out_dict = {
+             "affinity_pred_value": affinity_pred_value,
+             "affinity_logits_binary": affinity_logits_binary,
++            "affinity_g_raw": g_raw,
++            "affinity_g_after_affinity_out_mlp": g,
+         }
+         return out_dict
