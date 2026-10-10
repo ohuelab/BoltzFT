@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-ID_COL, SMILES_COL, LABEL_COL, SCORE_COL = "CID", "neut-smiles", "Active_v2", "affinity_probability_binary"
+ID_COL, SMILES_COL, LABEL_COL, SCORE_COL = "CID", "neut-smiles", "target_active_v2", "score_boltz2"
 
 
 def main() -> None:
