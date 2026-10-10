@@ -4,9 +4,10 @@
 
 Download `mf-pcba_test.zip` from the
 [boltzina v1.0.1 release](https://github.com/ohuelab/boltzina/releases/tag/v1.0.1).
-For each target, use its results CSV (`CID`, `neut-smiles`, `Active_v2`, and
-`affinity_probability_binary`) and the construct/MSA from the initial Boltz
-run. Compound IDs are listed in `data/splits/`.
+Extract the archive. For each target, use its CSV (`CID`, `neut-smiles`,
+`target_active_v2`, and `score_boltz2`) directly, together with the construct/MSA
+from the initial Boltz run. No column renaming is needed. Compound IDs are
+listed in `data/splits/`.
 
 Install the [Boltz2_affinity](https://github.com/molecularinformatics/Boltz2_affinity)
 environment and apply the patch:
@@ -28,7 +29,7 @@ export WORKDIR=/path/to/results
 export BOLTZ_CACHE=/path/to/boltz-cache
 export PYTHONPATH="$BOLTZ2_AFFINITY/src${PYTHONPATH:+:$PYTHONPATH}"
 export TARGET=588689
-export RESULTS_CSV=/path/to/588689_results.csv
+export RESULTS_CSV="/path/to/mf-pcba_test/$TARGET.csv"
 export MSA_CSV=/path/to/588689_msa.csv
 R="$WORKDIR/runs/$TARGET"
 ```
